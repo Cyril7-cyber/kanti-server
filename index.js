@@ -13,9 +13,13 @@ app.use(express.json());
 const authRoutes = require("./routes/auth");
 app.use("/api/auth", authRoutes);
 
-// Health check endpoint
+// Health check endpoints (for uptime checks / Render health checks)
 app.get("/health", (req, res) => {
   res.json({ status: "OK", message: "Kanti API Server is running" });
+});
+
+app.get("/healthz", (req, res) => {
+  res.type("text").send("Server is healthy");
 });
 
 // 404 handler
