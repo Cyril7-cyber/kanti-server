@@ -89,4 +89,154 @@ async function analyzeClothingImage(base64Image, mimeType) {
   };
 }
 
-module.exports = { analyzeClothingImage, GeminiError };
+const OOTD_OCCASIONS = ["Work", "Date", "Casual", "Dinner Night"];
+
+const OOTD_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    outfits: {
+      type: "array",
+      description: `Exactly one outfit per occasion, in this order: ${OOTD_OCCASIONS.join(", ")}.`,
+      items: {
+        type: "object",
+        properties: {
+          occasion: {
+            type: "string",
+            enum: OOTD_OCCASIONS,
+          },
+          itemIds: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "ids of the chosen wardrobe items, copied exactly from the provided wardrobe list",
+          },
+          note: {
+            type: "string",
+            description:
+              "one short, friendly styling tip (max ~15 words) explaining the pick, weather-aware",
+          },
+        },
+        required: ["occasion", "itemIds", "note"],
+      },
+    },
+  },
+  required: ["outfits"],
+};
+
+function buildOotdPrompt({ items, weather }) {
+  const wardrobeJson = JSON.stringify(
+    items.map((item) => ({
+      id: item.id,
+      category: item.category,
+      name: item.name,
+      fit: item.fit ?? null,
+      colors: item.colors ?? [],
+      pattern: item.pattern ?? null,
+      fabricType: item.fabricType ?? null,
+    })),
+  );
+
+  const weatherJson = JSON.stringify({
+    temperatureC: weather.temperatureC,
+    condition: weather.condition,
+    location: weather.location ?? null,
+  });
+
+  return `You are a personal stylist for the Kanti app. Build today's outfit-of-the-day (OOTD) picks for a user, using ONLY the clothing items in their wardrobe below.
+
+WARDROBE (JSON array, each item has a unique "id"):
+${wardrobeJson}
+
+TODAY'S WEATHER (JSON):
+${weatherJson}
+
+TASK:
+Create exactly one outfit for each of these occasions, in this order: ${OOTD_OCCASIONS.join(", ")}.
+
+RULES:
+1. Every outfit must be built entirely from the wardrobe list above. Never invent items or ids. Only use "id" values copied exactly from the wardrobe.
+2. Every outfit needs a complete base: either (one "Top" + one "Bottom") or one "Dress", plus one "Shoes" item. Add "Outerwear", "Sweater", "Accessories", or "Carry-on" pieces only when they suit the occasion and weather.
+3. Dress for the weather: if temperatureC is low or the condition suggests cold/rain/wind, favor warmer layers (Outerwear, Sweater, closed shoes) and add a layer where sensible; if it's warm and sunny, favor lighter pieces and skip heavy layers.
+4. Match formality to the occasion: "Work" should read polished/professional, "Date" and "Dinner Night" more elevated or evening-appropriate, "Casual" relaxed and easy.
+5. Keep each outfit visually coherent (colors and patterns that pair well together), and avoid reusing the exact same full outfit twice across occasions when the wardrobe has enough variety.
+6. Do not repeat an item's category twice within the same outfit (e.g. never two Tops in one outfit), except that Accessories may appear alongside anything.
+7. "note" is a short, warm, weather-aware styling tip a stylist friend might text you (max ~15 words).
+8. If the wardrobe is limited, still do your best to produce a complete, sensible outfit for every occasion rather than skipping one.
+
+Respond with JSON only, matching the required schema.`;
+}
+
+// Calls Gemini to compose weather- and occasion-aware outfits from a user's
+// wardrobe. `items` is the flat metadata for each wardrobe piece (no images —
+// wardrobe photos never leave the device, so this is a text-only call).
+// Throws GeminiError on any failure so the route can turn it into a clean
+// 502 without leaking upstream details.
+async function generateOotdSuggestions({ items, weather }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new GeminiError("GEMINI_API_KEY is not configured");
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: buildOotdPrompt({ items, weather }) }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: OOTD_RESPONSE_SCHEMA,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new GeminiError(`Gemini request failed (${res.status}): ${body}`);
+  }
+
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    throw new GeminiError("Gemini response had no content");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new GeminiError("Gemini response was not valid JSON");
+  }
+
+  if (!Array.isArray(parsed.outfits)) {
+    throw new GeminiError("Gemini response did not match the expected shape");
+  }
+
+  const validIds = new Set(items.map((item) => item.id));
+
+  // Defensively drop any hallucinated ids/occasions rather than trusting the
+  // model output verbatim.
+  const outfits = parsed.outfits
+    .filter(
+      (outfit) =>
+        outfit &&
+        OOTD_OCCASIONS.includes(outfit.occasion) &&
+        Array.isArray(outfit.itemIds),
+    )
+    .map((outfit) => ({
+      occasion: outfit.occasion,
+      itemIds: outfit.itemIds.filter((id) => validIds.has(id)),
+      note: typeof outfit.note === "string" ? outfit.note : "",
+    }))
+    .filter((outfit) => outfit.itemIds.length > 0);
+
+  return { outfits };
+}
+
+module.exports = {
+  analyzeClothingImage,
+  generateOotdSuggestions,
+  OOTD_OCCASIONS,
+  GeminiError,
+};

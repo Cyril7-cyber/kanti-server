@@ -16,6 +16,9 @@ app.use("/api/auth", authRoutes);
 const wardrobeRoutes = require("./routes/wardrobe");
 app.use("/api/wardrobe", wardrobeRoutes);
 
+const ootdRoutes = require("./routes/ootd");
+app.use("/api/ootd", ootdRoutes);
+
 // Health check endpoints (for uptime checks / Render health checks)
 app.get("/health", (req, res) => {
   res.json({ status: "OK", message: "Kanti API Server is running" });
